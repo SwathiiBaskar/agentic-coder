@@ -4,7 +4,7 @@ from typing import Any, AsyncGenerator
 import os
 from dotenv import load_dotenv
 
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APIError, AsyncOpenAI, RateLimitError
 from client.response import EventType, StreamEvent, TextDelta, TokenUsage
 load_dotenv()
 
@@ -36,13 +36,40 @@ class LLMClient:
             "messages": messages,
             "stream":stream
         }
-        if stream:
-            async for event in self._stream_response(client, kwargs):
-                yield event
-        else:
-            event=await self._non_stream_response(client, kwargs)
-            yield event
-        return
+        for attempt in range(self._max_retries+1):
+            try:
+                if stream:
+                    async for event in self._stream_response(client, kwargs):
+                        yield event
+                else:
+                    event=await self._non_stream_response(client, kwargs)
+                    yield event
+                return
+            except RateLimitError as e:
+                #exponential backoff
+                if attempt<self._max_retries:
+                    wait_time=2**attempt
+                    await asyncio.sleep(wait_time)
+                else:
+                    yield StreamEvent(
+                        type=EventType.ERROR,
+                        error=f"Rate limit exceeded: {e}"
+                    )
+                    return
+            except APIConnectionError as e:
+                if attempt<self._max_retries:
+                    wait_time=2**attempt
+                    await asyncio.sleep(wait_time)
+                else:
+                    yield StreamEvent(
+                        type=EventType.ERROR,
+                        error=f"API Connection Error: {e}"
+                    )
+                    return
+            except APIError as e:
+                yield StreamEvent(type =EventType.ERROR,
+                                  error=f"API Error: {e}")
+
             
     async def _stream_response(self, client: AsyncOpenAI, kwargs: dict[str, Any]) -> AsyncGenerator[StreamEvent, None]:
         response=await client.chat.completions.create(**kwargs)
